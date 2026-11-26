@@ -195,6 +195,24 @@
     `;
     document.head.appendChild(style);
 
+    const CONTRIBUTOR_ID_KEY = 'margo_contributor_id_v1';
+
+    function getContributorId() {
+        try {
+            return winRef.Engine?.hero?.d?.account || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function getHeroNick() {
+        try {
+            return winRef.Engine?.hero?.d?.nick || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     const floatBtn = document.createElement('div');
     floatBtn.id = 'margo-tools-float-btn';
     floatBtn.title = 'MargoTools - Status';
@@ -397,11 +415,20 @@
 
     async function sendToServer(endpoint, payload, silentStatus = false) {
         try {
+            const enrichedPayload = (payload && typeof payload === 'object' && !Array.isArray(payload))
+            ? { ...payload, _meta: { contributor_id: getContributorId(), hero_nick: getHeroNick() } }
+            : payload;
+
             const res = await fetch(`${SERVER_BASE_URL}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
+                body: JSON.stringify(enrichedPayload)
             });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const json = await res.json().catch(() => ({}));
+            if (typeof json.total_contributed === 'number') {
+                setLatestEntry('contributed', `${json.total_contributed}`);
+            }
             if (!res.ok) {
                 throw new Error(`HTTP ${res.status}`);
             }
