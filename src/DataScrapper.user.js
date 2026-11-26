@@ -2,8 +2,8 @@
 // @name         Margonem DataScrapper
 // @namespace    http://tampermonkey.net/
 // @author       Ronnie Radke
-// @version      4.0
-// @description  Full datascrapper do testów
+// @version      4.1
+// @description  Full Scrapper
 // @match        https://*.margonem.pl/
 // @exclude      https://www.margonem.pl/
 // @exclude      https://pomoc.margonem.pl/
@@ -395,14 +395,19 @@
         }
     });
 
-    async function sendToServer(endpoint, payload) {
+    async function sendToServer(endpoint, payload, silentStatus = false) {
         try {
-            await fetch(`${SERVER_BASE_URL}/${endpoint}`, {
+            const res = await fetch(`${SERVER_BASE_URL}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
             });
-            updateStatus(`Wysłano poprawnie do /${endpoint}`);
+            if (!res.ok) {
+                throw new Error(`HTTP ${res.status}`);
+            }
+            if (!silentStatus) {
+                updateStatus(`Wysłano poprawnie do /${endpoint}`);
+            }
         } catch (err) {
             updateStatus(`Błąd połączenia z serwerem (${endpoint}): ${err.message}`, true);
         }
@@ -629,214 +634,913 @@
             }
         },
         DialogScrapper: {
-            currentNpcId: null,
-            lastNodeId: 'root',
-            lastSentSignature: '',
-            activeTree: {
-                npc_id: null,
-                npc_name: null,
-                start_node_id: 'root',
-                nodes: {},
-                edges: []
+            STORAGE_KEY: 'margo_dialog_trees_v1',
+            dialogTrees: {},
+            npcSessionState: {},
+
+            sanitizeTree(tree) {
+                if (!tree || typeof tree !== 'object') return tree;
+                delete tree.edges;
+                if (tree.nodes && typeof tree.nodes === 'object') {
+                    Object.values(tree.nodes).forEach(entry => {
+                        if (entry && typeof entry === 'object') {
+                            delete entry.outgoing_connections;
+                            if (entry.node) delete entry.node._manualPos;
+                        }
+                    });
+                }
+                return tree;
             },
-            parsePayload(raw) {
-                if (!raw || typeof raw !== 'object') return null;
-                const npc = raw.npc || raw.d?.npc || {};
-                const npcId = npc.id ?? raw.npcId ?? raw.id ?? null;
-                if (!npcId) return null;
-
-                const npcName = npc.nick || npc.name || `NPC ${npcId}`;
-                const nodeId = String(raw.nodeId ?? raw.id ?? raw.stepId ?? this.lastNodeId ?? 'root');
-                const content = String(raw.text ?? raw.content ?? raw.msg ?? '').trim();
-                const type = String(raw.type ?? 'dialog');
-
-                const rawOptions = Array.isArray(raw.options) ? raw.options : (Array.isArray(raw.answers) ? raw.answers : []);
-                const options = rawOptions.map((opt, idx) => {
-                    const nextId = opt.nextNodeId ?? opt.next_node_id ?? opt.targetId ?? opt.to ?? null;
-                    return {
-                        action_code: String(opt.action ?? opt.code ?? idx + 1),
-                        label: String(opt.label ?? opt.text ?? opt.name ?? 'Opcja').trim(),
-                        next_node_id: nextId !== null && nextId !== undefined ? String(nextId) : null
-                    };
-                });
-
+            loadState() {
+                try {
+                    this.dialogTrees = JSON.parse(localStorage.getItem(this.STORAGE_KEY) || '{}');
+                    Object.keys(this.dialogTrees).forEach(npcId => this.sanitizeTree(this.dialogTrees[npcId]));
+                } catch (e) {
+                    this.dialogTrees = {};
+                }
+            },
+            saveState() {
+                try {
+                    localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.dialogTrees));
+                    if (winRef.MargoGraphEngine && typeof winRef.MargoGraphEngine.updateData === 'function') {
+                        winRef.MargoGraphEngine.updateData('dialog', this.dialogTrees);
+                    }
+                } catch (e) {}
+            },
+            parseTalkQuery(query) {
+                if (!query || typeof query !== 'string') return { npcId: null, actionCode: null };
+                const idMatch = query.match(/[?&]id=([^&]+)/);
+                const cMatch = query.match(/[?&]c=([^&]+)/);
                 return {
-                    npcId: String(npcId),
-                    npcName,
-                    nodeId,
-                    type,
-                    content,
-                    options,
-                    additional_actions: raw.additional_actions || null
+                    npcId: idMatch ? String(decodeURIComponent(idMatch[1])).trim() : null,
+                    actionCode: cMatch ? String(decodeURIComponent(cMatch[1])).trim() : null
                 };
             },
-            recordStep(parsed) {
-                if (!parsed) return;
+            cleanText(text, heroNick) {
+                const str = String(text ?? '');
+                if (!heroNick) return str;
+                return str.replaceAll(heroNick, '[NICK_POSTACI]');
+            },
+            detectNodeType(text, options) {
+                const joined = `${text || ''} ${(options || []).map(o => o.label).join(' ')}`.toLowerCase();
+                if (joined.includes('sklep') || joined.includes('kup') || joined.includes('handl')) return 'shop';
+                if (joined.includes('przen') || joined.includes('teleport') || joined.includes('udaj się')) return 'teleportation';
+                if (joined.includes('wylecz') || joined.includes('ulecz') || joined.includes('odpocz')) return 'hotel';
+                return 'special';
+            },
+            extractDialogPayload(query, response, heroNick) {
+                if (!response || !response.d) return null;
+                if (!query || !String(query).includes('talk')) return null;
 
-                if (this.currentNpcId !== parsed.npcId) {
-                    this.currentNpcId = parsed.npcId;
-                    this.activeTree = {
-                        npc_id: parsed.npcId,
-                        npc_name: parsed.npcName,
-                        start_node_id: parsed.nodeId,
-                        nodes: {},
-                        edges: []
-                    };
+                const d = response.d;
+                const parsedQuery = this.parseTalkQuery(query);
+                const npcId = String(d[2] || parsedQuery.npcId || '').trim();
+                const npcName = String(d[1] || '').trim();
+                const npcText = this.cleanText(d[4] ?? '', heroNick).trim();
+
+                const rawItems = [];
+                for (let i = 7; i < d.length; i++) {
+                    if (d[i] !== undefined) rawItems.push(d[i]);
                 }
 
-                const prevNodeId = this.lastNodeId;
-                this.lastNodeId = parsed.nodeId;
+                const filtered = rawItems.filter(item => !/^[1-9]$/.test(String(item).trim()));
+                const options = [];
+                for (let j = 0; j < filtered.length; j += 2) {
+                    const first = filtered[j];
+                    const second = filtered[j + 1];
+                    if (first !== undefined && second !== undefined) {
+                        const firstStr = String(first);
+                        const secondStr = String(second);
+                        const isFirstText = firstStr.length > 5 || firstStr.includes(' ');
+                        const optionText = this.cleanText(isFirstText ? firstStr : secondStr, heroNick).trim();
+                        const actionCode = (isFirstText ? secondStr : firstStr).trim();
 
-                this.activeTree.nodes[parsed.nodeId] = {
-                    node: {
-                        id: parsed.nodeId,
-                        type: parsed.type,
-                        content: parsed.content,
-                        additional_actions: parsed.additional_actions
-                    },
-                    options: parsed.options
-                };
-
-                parsed.options.forEach(opt => {
-                    if (opt.next_node_id) {
-                        const exists = this.activeTree.edges.some(
-                            e => e.from === parsed.nodeId && e.to === opt.next_node_id && e.label === opt.label
-                        );
-                        if (!exists) {
-                            this.activeTree.edges.push({
-                                from: parsed.nodeId,
-                                to: opt.next_node_id,
-                                label: `[${opt.action_code}] ${opt.label}`
-                            });
-                        }
-                    }
-                });
-
-                if (prevNodeId && prevNodeId !== parsed.nodeId && this.activeTree.nodes[prevNodeId]) {
-                    const linkedFromPrev = this.activeTree.edges.some(e => e.from === prevNodeId && e.to === parsed.nodeId);
-                    if (!linkedFromPrev) {
-                        this.activeTree.edges.push({
-                            from: prevNodeId,
-                            to: parsed.nodeId,
-                            label: 'krok'
+                        options.push({
+                            label: optionText,
+                            action_code: actionCode,
+                            next_node_id: null,
+                            additional_action: null,
+                            additional_actions: {},
+                            cooldown: 0,
+                            rules: {}
                         });
                     }
                 }
 
-                const sig = JSON.stringify(this.activeTree);
-                if (sig === this.lastSentSignature) return;
-                this.lastSentSignature = sig;
+                return {
+                    query: String(query),
+                    queryActionCode: parsedQuery.actionCode,
+                    npcId,
+                    npcName,
+                    npcText,
+                    options
+                };
+            },
+            ensureNpcTree(npcId, npcName) {
+                const key = String(npcId);
+                if (!this.dialogTrees[key]) {
+                    this.dialogTrees[key] = {
+                        npc_id: key,
+                        npc_name: npcName || `NPC ${key}`,
+                        start_node_id: 'root',
+                        nodes: {}
+                    };
+                } else {
+                    if (npcName) this.dialogTrees[key].npc_name = npcName;
+                    if (!this.dialogTrees[key].nodes) this.dialogTrees[key].nodes = {};
+                }
+                return this.dialogTrees[key];
+            },
+            ensureNpcSession(npcId) {
+                const key = String(npcId);
+                if (!this.npcSessionState[key]) {
+                    this.npcSessionState[key] = {
+                        currentNodeId: 'root',
+                        pendingActionCode: null
+                    };
+                }
+                return this.npcSessionState[key];
+            },
+            createNodeSchema(nodeId, content, options, additionalActions = {}) {
+                return {
+                    node: {
+                        id: nodeId,
+                        type: this.detectNodeType(content, options),
+                        content: content || '',
+                        action_data: {
+                            focus: {
+                                type: 'npc',
+                                npcId: null,
+                                locationId: null,
+                                mapId: null,
+                                x: null,
+                                y: null
+                            },
+                            minigame: {
+                                type: 'random',
+                                difficulty: 1
+                            }
+                        },
+                        additional_actions: additionalActions || {}
+                    },
+                    options: (options || []).map(opt => ({
+                        label: opt.label,
+                        action_code: opt.action_code,
+                        next_node_id: null,
+                        additional_action: null,
+                        additional_actions: {},
+                        cooldown: 0,
+                        rules: {}
+                    }))
+                };
+            },
+            extractAdditionalActions(response) {
+                const additional = {};
+                if (!response || typeof response !== 'object') return additional;
 
-                setLatestEntry('dialog', `${parsed.npcName} (#${parsed.npcId})`);
-                updateStatus(`Zaktualizowano dialog NPC: ${parsed.npcName} (węzły: ${Object.keys(this.activeTree.nodes).length})`);
+                const questIdFromTracking = response.tracking?.questId !== undefined ? response.tracking.questId : null;
+                const questIdFromQuestsData = Array.isArray(response.questsData?.quests?.list) && response.questsData.quests.list[0]?.id !== undefined
+                    ? response.questsData.quests.list[0].id
+                    : null;
+                const resolvedQuestId = questIdFromTracking ?? questIdFromQuestsData;
 
-                if (winRef.MargoGraphEngine && typeof winRef.MargoGraphEngine.updateData === 'function') {
-                    winRef.MargoGraphEngine.updateData('dialog', {
-                        [this.currentNpcId]: JSON.parse(sig)
+                if (response.item && typeof response.item === 'object') {
+                    const itemsByTpl = new Map();
+                    Object.values(response.item).forEach(it => {
+                        if (!it || typeof it !== 'object') return;
+                        const tpl = it.tpl ?? null;
+                        const key = tpl !== null ? `tpl_${tpl}` : `id_${it.id ?? Math.random()}`;
+                        const statStr = String(it.stat || '');
+                        const questMatch = statStr.match(/quest=([^;]+)/);
+                        const questIdsFromStat = questMatch
+                            ? questMatch[1].split(',').map(v => Number(v.trim())).filter(v => !Number.isNaN(v))
+                            : [];
+
+                        if (!itemsByTpl.has(key)) {
+                            itemsByTpl.set(key, {
+                                tpl,
+                                name: it.name || 'Nieznany przedmiot',
+                                icon: it.icon || '',
+                                amount: 1,
+                                quest_ids: questIdsFromStat
+                            });
+                        } else {
+                            itemsByTpl.get(key).amount += 1;
+                        }
                     });
+
+                    const itemsList = Array.from(itemsByTpl.values());
+                    if (itemsList.length > 0) {
+                        const statQuestIds = itemsList.flatMap(i => i.quest_ids || []);
+                        const itemQuestId = resolvedQuestId ?? (statQuestIds.length > 0 ? statQuestIds[0] : null);
+                        additional.give_items = {
+                            quest_id: itemQuestId,
+                            linked_sraj_ids: [],
+                            items: itemsList
+                        };
+                    }
                 }
 
+                const srajList = Array.isArray(response.sraj) ? response.sraj : [];
+                const tplList = Array.isArray(response.sraj_tpl) ? response.sraj_tpl : [];
+                if (srajList.length > 0 || tplList.length > 0) {
+                    const tplById = new Map();
+                    tplList.forEach(t => {
+                        if (t && t.id !== undefined) tplById.set(String(t.id), t);
+                    });
+
+                    const idsToProcess = srajList.length > 0
+                        ? srajList.map(s => String(s.id))
+                        : tplList.map(t => String(t.id));
+
+                    const effects = idsToProcess.map(id => {
+                        const tplEntry = tplById.get(id) || {};
+                        let parsedAppear = tplEntry.appear ?? null;
+                        let jsScript = null;
+
+                        if (typeof parsedAppear === 'string') {
+                            try {
+                                const obj = JSON.parse(parsedAppear);
+                                if (obj && typeof obj === 'object') {
+                                    jsScript = obj.jsScript || null;
+                                    parsedAppear = obj;
+                                }
+                            } catch (e) {}
+                        }
+
+                        const triggerName = typeof jsScript === 'string' && jsScript.includes('clickEqColumnShow')
+                            ? 'SHOW_EQ_COLUMN'
+                            : 'UI_EFFECT';
+
+                        return {
+                            sraj_id: Number.isNaN(Number(id)) ? id : Number(id),
+                            quest_id: resolvedQuestId,
+                            trigger: triggerName,
+                            js_script: jsScript,
+                            appear: parsedAppear,
+                            cancel: tplEntry.cancel ?? null,
+                            related_item_tpls: []
+                        };
+                    });
+
+                    if (effects.length > 0) {
+                        additional.ui_effect = effects.length === 1 ? effects[0] : effects;
+                    }
+                }
+
+                const srajIds = Array.isArray(additional.ui_effect)
+                    ? additional.ui_effect.map(e => e.sraj_id)
+                    : (additional.ui_effect ? [additional.ui_effect.sraj_id] : []);
+                const itemTpls = additional.give_items ? additional.give_items.items.map(i => i.tpl).filter(Boolean) : [];
+
+                if (additional.give_items && srajIds.length > 0) {
+                    additional.give_items.linked_sraj_ids = srajIds;
+                }
+                if (additional.ui_effect) {
+                    const applyLinks = (eff) => {
+                        if (itemTpls.length > 0) {
+                            eff.related_item_tpls = Array.from(new Set([...(eff.related_item_tpls || []), ...itemTpls]));
+                        }
+                        if (!eff.quest_id && additional.give_items?.quest_id) {
+                            eff.quest_id = additional.give_items.quest_id;
+                        }
+                    };
+                    if (Array.isArray(additional.ui_effect)) additional.ui_effect.forEach(applyLinks);
+                    else applyLinks(additional.ui_effect);
+                }
+
+                return additional;
+            },
+            buildNodeFingerprint(content, options) {
+                const cleanContent = String(content || '').trim();
+                const optsSig = (options || [])
+                    .map(o => `${String(o.action_code || '').trim()}::${String(o.label || '').trim()}`)
+                    .join('|');
+                return `${cleanContent}###${optsSig}`;
+            },
+            findExistingEquivalentNode(tree, content, options, preferredNodeId) {
+                if (!tree || !tree.nodes) return null;
+                if (tree.nodes[preferredNodeId]) return preferredNodeId;
+                const targetFp = this.buildNodeFingerprint(content, options);
+                if (!targetFp || targetFp === '###') return null;
+
+                if (tree.nodes.root) {
+                    const rootEntry = tree.nodes.root;
+                    if (this.buildNodeFingerprint(rootEntry.node?.content, rootEntry.options) === targetFp) {
+                        return 'root';
+                    }
+                }
+
+                for (const existingId of Object.keys(tree.nodes)) {
+                    const entry = tree.nodes[existingId];
+                    if (this.buildNodeFingerprint(entry.node?.content, entry.options) === targetFp) {
+                        return existingId;
+                    }
+                }
+                return null;
+            },
+            findParentNodeForAction(tree, session, targetNodeId, actionCode) {
+                if (!actionCode) return null;
+                if (session.currentNodeId && tree.nodes[session.currentNodeId] && session.currentNodeId !== targetNodeId) {
+                    const currEntry = tree.nodes[session.currentNodeId];
+                    if ((currEntry.options || []).some(o => o.action_code === actionCode)) {
+                        return currEntry;
+                    }
+                }
+                for (const k of Object.keys(tree.nodes).reverse()) {
+                    if (k === targetNodeId) continue;
+                    const candidate = tree.nodes[k];
+                    if ((candidate.options || []).some(o => o.action_code === actionCode)) {
+                        return candidate;
+                    }
+                }
+                return null;
+            },
+            recordOutgoingChoice(query) {
+                const parsed = this.parseTalkQuery(query);
+                if (!parsed.npcId || !parsed.actionCode) return;
+                const session = this.ensureNpcSession(parsed.npcId);
+                session.pendingActionCode = parsed.actionCode;
+            },
+            recordStep(query, response) {
+                let heroNick = '';
+                try {
+                    if (winRef.Engine && winRef.Engine.hero && winRef.Engine.hero.d) {
+                        heroNick = winRef.Engine.hero.d.nick || '';
+                    }
+                } catch (e) {}
+
+                const payload = this.extractDialogPayload(query, response, heroNick);
+                if (!payload || !payload.npcId) return false;
+
+                const npcKey = payload.npcId;
+                const tree = this.ensureNpcTree(npcKey, payload.npcName);
+                const session = this.ensureNpcSession(npcKey);
+                const actionUsed = payload.queryActionCode || session.pendingActionCode || null;
+
+                const isEmptyEndPacket = !payload.npcText && payload.options.length === 0;
+                if (isEmptyEndPacket) {
+                    if (actionUsed && session.currentNodeId && tree.nodes[session.currentNodeId]) {
+                        const prevNode = tree.nodes[session.currentNodeId];
+                        const matchingOpt = (prevNode.options || []).find(o => o.action_code === actionUsed);
+                        if (matchingOpt) matchingOpt.next_node_id = null;
+                    }
+                    session.pendingActionCode = null;
+                    session.currentNodeId = 'root';
+                    this.saveState();
+                    sendToServer('save_dialog_tree', {
+                        npc_key: npcKey,
+                        dialog_tree: this.sanitizeTree(JSON.parse(JSON.stringify(tree)))
+                    });
+                    return true;
+                }
+
+                const candidateId = actionUsed ? `c_${actionUsed}` : 'root';
+                const nodeId = this.findExistingEquivalentNode(tree, payload.npcText, payload.options, candidateId) || candidateId;
+                const detectedActions = this.extractAdditionalActions(response);
+
+                if (!tree.nodes[nodeId]) {
+                    tree.nodes[nodeId] = this.createNodeSchema(nodeId, payload.npcText, payload.options, detectedActions);
+                } else {
+                    tree.nodes[nodeId].node.content = payload.npcText;
+                    tree.nodes[nodeId].node.type = this.detectNodeType(payload.npcText, payload.options);
+
+                    const prevOptionsMap = new Map((tree.nodes[nodeId].options || []).map(o => [o.action_code, o]));
+                    tree.nodes[nodeId].options = payload.options.map(opt => {
+                        const oldOpt = prevOptionsMap.get(opt.action_code);
+                        return {
+                            label: opt.label,
+                            action_code: opt.action_code,
+                            next_node_id: oldOpt ? oldOpt.next_node_id : null,
+                            additional_action: oldOpt ? oldOpt.additional_action : null,
+                            additional_actions: oldOpt ? oldOpt.additional_actions : {},
+                            cooldown: oldOpt ? oldOpt.cooldown : 0,
+                            rules: oldOpt ? oldOpt.rules : {}
+                        };
+                    });
+
+                    if (Object.keys(detectedActions).length > 0) {
+                        tree.nodes[nodeId].node.additional_actions = {
+                            ...(tree.nodes[nodeId].node.additional_actions || {}),
+                            ...detectedActions
+                        };
+                    }
+                }
+
+                if (actionUsed) {
+                    const parentEntry = this.findParentNodeForAction(tree, session, nodeId, actionUsed);
+                    if (parentEntry) {
+                        const matchedOption = (parentEntry.options || []).find(o => o.action_code === actionUsed);
+                        if (matchedOption) matchedOption.next_node_id = nodeId;
+                    }
+                }
+
+                session.currentNodeId = nodeId;
+                session.pendingActionCode = null;
+
+                setLatestEntry('dialog', `${tree.npc_name} (#${npcKey})`);
+                updateStatus(`Zapisano dialog NPC: ${tree.npc_name} (nody: ${Object.keys(tree.nodes).length})`);
+
+                this.saveState();
                 sendToServer('save_dialog_tree', {
-                    npc_key: this.currentNpcId,
-                    dialog_tree: this.activeTree
+                    npc_key: npcKey,
+                    dialog_tree: this.sanitizeTree(JSON.parse(JSON.stringify(tree)))
                 });
+                return true;
             },
             init() {
-                const timer = setInterval(() => {
-                    const dlg = winRef.Engine?.dialog;
-                    if (!dlg) return;
-                    clearInterval(timer);
-
-                    const origShow = typeof dlg.show === 'function' ? dlg.show.bind(dlg) : null;
-                    if (origShow) {
-                        dlg.show = (...args) => {
-                            const res = origShow(...args);
-                            const parsed = this.parsePayload(args[0] || dlg.data || dlg);
-                            if (parsed) this.recordStep(parsed);
-                            return res;
-                        };
-                    }
-
-                    const origUpdate = typeof dlg.update === 'function' ? dlg.update.bind(dlg) : null;
-                    if (origUpdate) {
-                        dlg.update = (...args) => {
-                            const res = origUpdate(...args);
-                            const parsed = this.parsePayload(args[0] || dlg.data || dlg);
-                            if (parsed) this.recordStep(parsed);
-                            return res;
-                        };
-                    }
-                }, 500);
+                this.loadState();
             }
         },
         QuestScrapper: {
-            lastSentQuestsHash: '',
-            extractQuestsMap() {
-                const qMod = winRef.Engine?.quests;
-                if (!qMod) return null;
+            STORAGE_KEY: 'margo_quests_tree_v2',
+            PENDING_KEY: 'margo_quests_pending_trackers',
+            questsTree: {},
+            pendingTrackers: {},
+            skippedIncompleteQuestIds: new Set(),
 
-                const rawList = typeof qMod.getList === 'function'
-                    ? qMod.getList()
-                    : (qMod.quests || qMod.data || null);
-
-                if (!rawList) return null;
-
-                const entries = Array.isArray(rawList)
-                    ? rawList.map((item, idx) => [item?.id ?? idx, item])
-                    : Object.entries(rawList);
-
-                const questsOut = {};
-                for (const [key, q] of entries) {
-                    if (!q || typeof q !== 'object') continue;
-                    const qId = String(q.id ?? key);
-                    if (!qId) continue;
-
-                    const rawStages = Array.isArray(q.stages)
-                        ? q.stages
-                        : (Array.isArray(q.stages?.list) ? q.stages.list : []);
-
-                    questsOut[qId] = {
-                        id: qId,
-                        name: q.name || q.title || `Quest ${qId}`,
-                        status: q.status || (q.done ? 'finished' : 'active'),
-                        requirements: q.requirements || {},
-                        stages: {
-                            list: rawStages.map((st, idx) => ({
-                                step: st.step ?? idx + 1,
-                                description: st.description || st.desc || st.text || '',
-                                missions: Array.isArray(st.missions) ? st.missions : [],
-                                targets: Array.isArray(st.targets) ? st.targets : [],
-                                related_items: Array.isArray(st.related_items) ? st.related_items : [],
-                                ui_effects: Array.isArray(st.ui_effects) ? st.ui_effects : []
-                            }))
-                        }
+            loadState() {
+                try {
+                    const legacyTree = localStorage.getItem('margo_quests_tree');
+                    const currentTree = localStorage.getItem(this.STORAGE_KEY);
+                    this.questsTree = JSON.parse(currentTree || legacyTree || '{}');
+                    this.pendingTrackers = JSON.parse(localStorage.getItem(this.PENDING_KEY) || '{}');
+                } catch (e) {
+                    this.questsTree = {};
+                    this.pendingTrackers = {};
+                }
+            },
+            saveState() {
+                try {
+                    localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.questsTree));
+                    localStorage.setItem(this.PENDING_KEY, JSON.stringify(this.pendingTrackers));
+                    if (winRef.MargoGraphEngine && typeof winRef.MargoGraphEngine.updateData === 'function') {
+                        winRef.MargoGraphEngine.updateData('quest', this.questsTree);
+                    }
+                } catch (e) {}
+            },
+            ensureQuestEntry(qId, baseData = {}) {
+                const key = String(qId);
+                if (!this.questsTree[key]) {
+                    this.questsTree[key] = {
+                        id: Number.isNaN(Number(qId)) ? qId : Number(qId),
+                        name: baseData.name || 'Nieznany quest',
+                        status: baseData.status || 'active',
+                        markerId: baseData.markerId !== undefined ? baseData.markerId : 0,
+                        requirements: baseData.requirements || {
+                            finished: [],
+                            lvlMax: 0,
+                            lvlMin: 0,
+                            other: false,
+                            prof: 0
+                        },
+                        properties: baseData.properties || {},
+                        stages: { list: [] }
                     };
+                } else {
+                    const entry = this.questsTree[key];
+                    if (baseData.name) entry.name = baseData.name;
+                    if (baseData.status) entry.status = baseData.status;
+                    if (baseData.properties) entry.properties = { ...entry.properties, ...baseData.properties };
+                    if (baseData.requirements) entry.requirements = { ...entry.requirements, ...baseData.requirements };
+                    if (baseData.markerId !== undefined) entry.markerId = baseData.markerId;
+                    if (!entry.stages || !Array.isArray(entry.stages.list)) {
+                        entry.stages = { list: [] };
+                    }
+                }
+                return this.questsTree[key];
+            },
+            normalizeMissions(q) {
+                const rawList =
+                    (q.missions && Array.isArray(q.missions.list) && q.missions.list) ||
+                    (Array.isArray(q.missions) && q.missions) ||
+                    [];
+
+                return rawList.map((m, idx) => ({
+                    index: idx + 1,
+                    mission_type: m.type ?? m.mission_type ?? 0,
+                    title: m.title || (m.type === 2 ? 'Zabij' : 'Misja'),
+                    names: Array.isArray(m.names) ? m.names : (m.name ? [m.name] : []),
+                    current: m.amount?.value ?? m.amount?.cur ?? m.cur ?? 0,
+                    total: m.amount?.total ?? m.total ?? 1,
+                    done: Boolean(m.isDone ?? m.done ?? m.completed ?? false)
+                }));
+            },
+            normalizeTargets(list) {
+                if (!Array.isArray(list)) return [];
+                return list.map((m, idx) => {
+                    const npcData = m.data || {};
+                    const positions = Array.isArray(m.pos)
+                        ? m.pos.map(p => ({
+                            map_id: p.town ?? p.mapId ?? null,
+                            map_name: p.name || 'Nieznana lokacja',
+                            x: p.x ?? null,
+                            y: p.y ?? null
+                        }))
+                        : [];
+
+                    return {
+                        target_id: m.id ?? idx + 1,
+                        type: m.type || 'KILL',
+                        npc: {
+                            id: npcData.id ?? null,
+                            name: npcData.name || 'Nieznany cel',
+                            entity_type: npcData.type || 'NPC_TPL'
+                        },
+                        amount: {
+                            current: m.progress?.amount ?? 0,
+                            total: m.progress?.total ?? 1
+                        },
+                        locations: positions
+                    };
+                });
+            },
+            buildTargetsSummary(targets) {
+                const safeTargets = Array.isArray(targets) ? targets : [];
+                const uniqueNpcs = [];
+                const seenNpcIds = new Set();
+                const uniqueLocations = [];
+                const seenLocKeys = new Set();
+
+                safeTargets.forEach(t => {
+                    const npcKey = `${t.npc?.id ?? ''}_${t.npc?.name ?? ''}`;
+                    if (t.npc?.name && !seenNpcIds.has(npcKey)) {
+                        seenNpcIds.add(npcKey);
+                        uniqueNpcs.push({ id: t.npc.id, name: t.npc.name });
+                    }
+                    (t.locations || []).forEach(loc => {
+                        const locKey = `${loc.map_id ?? ''}_${loc.map_name}_${loc.x ?? ''}_${loc.y ?? ''}`;
+                        if (!seenLocKeys.has(locKey)) {
+                            seenLocKeys.add(locKey);
+                            uniqueLocations.push(loc);
+                        }
+                    });
+                });
+
+                return {
+                    targets_count: safeTargets.length,
+                    npcs_count: uniqueNpcs.length,
+                    npcs: uniqueNpcs,
+                    locations: uniqueLocations
+                };
+            },
+            hasRecordedStartStage(questEntry) {
+                if (!questEntry?.stages?.list || !Array.isArray(questEntry.stages.list)) return false;
+                const step1 = questEntry.stages.list.find(s => Number(s.step) === 1);
+                if (!step1) return false;
+                const hasDesc = Boolean(String(step1.description || '').trim());
+                const hasMissions = Array.isArray(step1.missions) && step1.missions.length > 0;
+                return hasDesc || hasMissions;
+            },
+            canProcessQuestData(qId, rawQuestObj) {
+                const key = String(qId);
+                if (this.skippedIncompleteQuestIds.has(key)) return false;
+
+                const existing = this.questsTree?.[key];
+                if (existing && this.hasRecordedStartStage(existing)) return true;
+
+                const desc = String(rawQuestObj?.description ?? rawQuestObj?.desc ?? '').trim();
+                const missions = this.normalizeMissions(rawQuestObj || {});
+                const isCreateAction = String(rawQuestObj?.action || '').toUpperCase() === 'CREATE';
+                const isStarter = String(rawQuestObj?.status || '').toLowerCase() === 'starter';
+
+                if (isCreateAction || isStarter || desc.length > 0 || missions.length > 0) return true;
+
+                if (String(rawQuestObj?.status || '').toLowerCase() === 'active' && !existing) {
+                    this.skippedIncompleteQuestIds.add(key);
+                    return false;
+                }
+                return true;
+            },
+            extractRelatedItems(res, questId = null) {
+                const itemsByTpl = new Map();
+                if (res?.item && typeof res.item === 'object') {
+                    Object.values(res.item).forEach(it => {
+                        if (!it || typeof it !== 'object') return;
+                        const tpl = it.tpl ?? null;
+                        const key = tpl !== null ? `tpl_${tpl}` : `id_${it.id ?? Math.random()}`;
+                        const statStr = String(it.stat || '');
+                        const questMatch = statStr.match(/quest=([^;]+)/);
+                        const questIdsFromStat = questMatch
+                            ? questMatch[1].split(',').map(v => Number(v.trim())).filter(v => !Number.isNaN(v))
+                            : [];
+
+                        if (questId !== null && questIdsFromStat.length > 0 && !questIdsFromStat.includes(Number(questId))) {
+                            return;
+                        }
+
+                        if (!itemsByTpl.has(key)) {
+                            itemsByTpl.set(key, {
+                                tpl,
+                                name: it.name || 'Nieznany przedmiot',
+                                icon: it.icon || '',
+                                amount: 1,
+                                quest_ids: questIdsFromStat
+                            });
+                        } else {
+                            itemsByTpl.get(key).amount += 1;
+                        }
+                    });
                 }
 
-                return Object.keys(questsOut).length > 0 ? questsOut : null;
+                if (Array.isArray(res?.tracking?.list)) {
+                    res.tracking.list.forEach(entry => {
+                        if (entry?.data?.type === 'ITEM' && entry?.data?.id !== undefined) {
+                            const tpl = entry.data.id;
+                            const key = `tpl_${tpl}`;
+                            if (!itemsByTpl.has(key)) {
+                                itemsByTpl.set(key, {
+                                    tpl,
+                                    name: entry.data.name || 'Nieznany przedmiot',
+                                    icon: '',
+                                    amount: entry.progress?.amount ?? 1,
+                                    quest_ids: res.tracking.questId !== undefined ? [res.tracking.questId] : []
+                                });
+                            }
+                        }
+                    });
+                }
+
+                return Array.from(itemsByTpl.values());
             },
-            init() {
-                setInterval(() => {
-                    try {
-                        const questsMap = this.extractQuestsMap();
-                        if (!questsMap) return;
+            extractUiEffects(res, questId = null, relatedItems = []) {
+                const srajList = Array.isArray(res?.sraj) ? res.sraj : [];
+                const tplList = Array.isArray(res?.sraj_tpl) ? res.sraj_tpl : [];
+                if (srajList.length === 0 && tplList.length === 0) return [];
 
-                        const serialized = JSON.stringify(questsMap);
-                        if (serialized === this.lastSentQuestsHash) return;
-                        this.lastSentQuestsHash = serialized;
+                const tplById = new Map();
+                tplList.forEach(t => {
+                    if (t && t.id !== undefined) tplById.set(String(t.id), t);
+                });
 
-                        const count = Object.keys(questsMap).length;
-                        setLatestEntry('quest', `${count} questów`);
-                        updateStatus(`Zaktualizowano listę questów (${count})`);
+                const ids = srajList.length > 0 ? srajList.map(s => String(s.id)) : tplList.map(t => String(t.id));
+                const trackingTpls = Array.isArray(res?.tracking?.list)
+                    ? res.tracking.list.filter(m => m?.data?.type === 'ITEM' && m?.data?.id !== undefined).map(m => m.data.id)
+                    : [];
+                const itemTplsFromList = relatedItems.map(i => i.tpl).filter(Boolean);
+                const relatedTpls = Array.from(new Set([...trackingTpls, ...itemTplsFromList]));
 
-                        if (winRef.MargoGraphEngine && typeof winRef.MargoGraphEngine.updateData === 'function') {
-                            winRef.MargoGraphEngine.updateData('quest', questsMap);
+                return ids.map(id => {
+                    const tplEntry = tplById.get(id) || {};
+                    let parsedAppear = tplEntry.appear ?? null;
+                    let jsScript = null;
+
+                    if (typeof parsedAppear === 'string') {
+                        try {
+                            const parsed = JSON.parse(parsedAppear);
+                            if (parsed && typeof parsed === 'object') {
+                                jsScript = parsed.jsScript || null;
+                                parsedAppear = parsed;
+                            }
+                        } catch (e) {}
+                    }
+
+                    const trigger = typeof jsScript === 'string' && jsScript.includes('clickEqColumnShow')
+                        ? 'SHOW_EQ_COLUMN'
+                        : 'UI_EFFECT';
+
+                    return {
+                        sraj_id: Number.isNaN(Number(id)) ? id : Number(id),
+                        quest_id: res?.tracking?.questId ?? questId ?? null,
+                        trigger,
+                        js_script: jsScript,
+                        appear: parsedAppear,
+                        cancel: tplEntry.cancel ?? null,
+                        related_item_tpls: relatedTpls
+                    };
+                });
+            },
+            attachUiEffectsToStage(stage, uiEffects) {
+                if (!stage || !Array.isArray(uiEffects) || uiEffects.length === 0) return false;
+                stage.ui_effects = Array.isArray(stage.ui_effects) ? stage.ui_effects : [];
+                const existingIds = new Set(stage.ui_effects.map(e => String(e.sraj_id)));
+                let added = false;
+
+                uiEffects.forEach(eff => {
+                    const key = String(eff.sraj_id);
+                    if (!existingIds.has(key)) {
+                        stage.ui_effects.push(eff);
+                        existingIds.add(key);
+                        added = true;
+                    } else {
+                        stage.ui_effects = stage.ui_effects.map(existing => {
+                            if (String(existing.sraj_id) !== key) return existing;
+                            return {
+                                ...existing,
+                                quest_id: existing.quest_id ?? eff.quest_id,
+                                related_item_tpls: Array.from(new Set([...(existing.related_item_tpls || []), ...(eff.related_item_tpls || [])]))
+                            };
+                        });
+                    }
+                });
+
+                return added;
+            },
+            attachTargetsToStage(questId, targets, extra = {}) {
+                const qId = String(questId);
+                if (this.skippedIncompleteQuestIds.has(qId)) return false;
+
+                const existing = this.questsTree?.[qId];
+                if (!existing || !this.hasRecordedStartStage(existing)) {
+                    this.pendingTrackers[qId] = targets;
+                    return false;
+                }
+
+                const stagesList = existing.stages.list;
+                const currentStage = stagesList[stagesList.length - 1];
+                currentStage.targets = targets;
+                currentStage.targetsSummary = this.buildTargetsSummary(targets);
+
+                if (Array.isArray(extra.relatedItems) && extra.relatedItems.length > 0) {
+                    currentStage.related_items = extra.relatedItems;
+                }
+                if (Array.isArray(extra.uiEffects) && extra.uiEffects.length > 0) {
+                    this.attachUiEffectsToStage(currentStage, extra.uiEffects);
+                }
+
+                return true;
+            },
+            findTrackerPayload(obj, depth = 0) {
+                if (!obj || typeof obj !== 'object' || depth > 5) return null;
+                if (obj.action === 'SHOW' && obj.questId && Array.isArray(obj.list)) return obj;
+                if (obj.questId && Array.isArray(obj.list) && obj.list.some(item => item && (item.pos || item.data || item.progress))) return obj;
+
+                for (const key of Object.keys(obj)) {
+                    const val = obj[key];
+                    if (val && typeof val === 'object') {
+                        const found = this.findTrackerPayload(val, depth + 1);
+                        if (found) return found;
+                    }
+                }
+                return null;
+            },
+            extractQuestItems(res) {
+                const candidates = [
+                    res?.quests?.list,
+                    res?.questsData?.quests?.list,
+                    res?.qlines?.quests?.list,
+                    Array.isArray(res?.qlines) ? res.qlines : null,
+                    Array.isArray(res?.list) && !res?.questId ? res.list : null,
+                    (res?.id && (res?.name || res?.description || res?.missions)) ? [res] : null
+                ];
+                for (const list of candidates) {
+                    if (Array.isArray(list) && list.length > 0) return list;
+                }
+                return [];
+            },
+            getOrCreateStage(questObj, desc, missions) {
+                const stages = questObj.stages.list;
+                const cleanDesc = (desc || '').trim();
+                const missionSig = JSON.stringify(missions.map(m => [m.mission_type, m.title, m.names, m.total]));
+
+                const exactMatch = stages.find(s => s.description === cleanDesc && s._sig === missionSig);
+                if (exactMatch) {
+                    exactMatch.missions = missions;
+                    if (!exactMatch.targetsSummary) exactMatch.targetsSummary = this.buildTargetsSummary(exactMatch.targets || []);
+                    if (!Array.isArray(exactMatch.ui_effects)) exactMatch.ui_effects = [];
+                    return exactMatch;
+                }
+
+                const lastStage = stages[stages.length - 1];
+                if (lastStage && lastStage.description === '' && cleanDesc !== '') {
+                    lastStage.description = cleanDesc;
+                    lastStage.missions = missions;
+                    lastStage._sig = missionSig;
+                    if (!lastStage.targetsSummary) lastStage.targetsSummary = this.buildTargetsSummary(lastStage.targets || []);
+                    if (!Array.isArray(lastStage.ui_effects)) lastStage.ui_effects = [];
+                    return lastStage;
+                }
+
+                if (!lastStage || lastStage.description !== cleanDesc || lastStage._sig !== missionSig) {
+                    const newStage = {
+                        step: stages.length + 1,
+                        description: cleanDesc,
+                        missions,
+                        targetsSummary: { targets_count: 0, npcs_count: 0, npcs: [], locations: [] },
+                        targets: [],
+                        ui_effects: [],
+                        _sig: missionSig
+                    };
+                    stages.push(newStage);
+                    return newStage;
+                }
+
+                return lastStage;
+            },
+            parsePacket(res) {
+                if (!res || typeof res !== 'object') return false;
+                let changed = false;
+
+                const trackerPayload = this.findTrackerPayload(res);
+                const trackerQuestId = trackerPayload?.questId ?? res?.tracking?.questId ?? null;
+                const relatedItems = this.extractRelatedItems(res, trackerQuestId);
+                const uiEffects = this.extractUiEffects(res, trackerQuestId, relatedItems);
+
+                const qList = this.extractQuestItems(res);
+                if (qList.length > 0) {
+                    qList.forEach(q => {
+                        if (!q || !q.id) return;
+                        const qId = String(q.id);
+                        if (!this.canProcessQuestData(qId, q)) return;
+
+                        const questEntry = this.ensureQuestEntry(qId, q);
+                        const qDesc = q.description ?? q.desc ?? '';
+                        const missionsList = this.normalizeMissions(q);
+                        const targetStage = this.getOrCreateStage(questEntry, qDesc, missionsList);
+
+                        if (this.pendingTrackers[qId] && this.pendingTrackers[qId].length > 0) {
+                            targetStage.targets = this.pendingTrackers[qId];
+                            targetStage.targetsSummary = this.buildTargetsSummary(this.pendingTrackers[qId]);
+                            delete this.pendingTrackers[qId];
                         }
 
-                        sendToServer('save_quests', { quests: questsMap });
-                    } catch (err) {}
-                }, 1000);
+                        const questItems = this.extractRelatedItems(res, q.id);
+                        if (questItems.length > 0) targetStage.related_items = questItems;
+
+                        const stageEffects = this.extractUiEffects(res, q.id, questItems.length > 0 ? questItems : relatedItems);
+                        if (stageEffects.length > 0) this.attachUiEffectsToStage(targetStage, stageEffects);
+
+                        changed = true;
+                    });
+                }
+
+                if (trackerPayload) {
+                    const qId = String(trackerPayload.questId);
+                    const mappedTargets = this.normalizeTargets(trackerPayload.list);
+                    if (this.attachTargetsToStage(qId, mappedTargets, { relatedItems, uiEffects })) {
+                        changed = true;
+                    }
+                } else if (uiEffects.length > 0 && trackerQuestId) {
+                    const qId = String(trackerQuestId);
+                    const questObj = this.questsTree[qId];
+                    if (questObj && this.hasRecordedStartStage(questObj) && Array.isArray(questObj.stages?.list) && questObj.stages.list.length > 0) {
+                        const lastStage = questObj.stages.list[questObj.stages.list.length - 1];
+                        if (this.attachUiEffectsToStage(lastStage, uiEffects)) {
+                            changed = true;
+                        }
+                    }
+                }
+
+                if (changed) {
+                    const count = Object.keys(this.questsTree).length;
+                    setLatestEntry('quest', `${count} questów`);
+                    updateStatus(`Zaktualizowano questy (łącznie: ${count})`);
+                    this.saveState();
+                    sendToServer('save_quests', { quests: this.questsTree });
+                }
+
+                return changed;
+            },
+            init() {
+                this.loadState();
             }
+        },
+        initNetworkHook() {
+            const checkG = setInterval(() => {
+                if (winRef._g && !winRef._g.__margo_all_in_one_hooked) {
+                    winRef._g.__margo_all_in_one_hooked = true;
+                    clearInterval(checkG);
+
+                    const original_g = winRef._g;
+
+                    winRef._g = function(query, callback) {
+                        try {
+                            if (query && typeof query === 'string' && query.includes('talk')) {
+                                MargoTools.DialogScrapper.recordOutgoingChoice(query);
+                            }
+                        } catch (e) {}
+
+                        const wrappedCallback = function(response) {
+                            try {
+                                if (response && typeof response === 'object') {
+                                    if (query && typeof query === 'string' && query.includes('talk') && response.d) {
+                                        MargoTools.DialogScrapper.recordStep(query, response);
+                                    }
+
+                                    const hasQuestPayload = Boolean(
+                                        response.questsData ||
+                                        response.qlines ||
+                                        response.quests ||
+                                        MargoTools.QuestScrapper.findTrackerPayload(response) ||
+                                        Array.isArray(response.sraj) ||
+                                        Array.isArray(response.sraj_tpl) ||
+                                        (typeof query === 'string' && (query.includes('quest') || query.includes('qlines') || query.includes('tracker')))
+                                    );
+                                    if (hasQuestPayload) {
+                                        MargoTools.QuestScrapper.parsePacket(response);
+                                    }
+                                }
+                            } catch (err) {
+                                updateStatus(`Błąd w hooku _g: ${err.message}`, true);
+                            }
+
+                            if (typeof callback === 'function') return callback(response);
+                        };
+
+                        return original_g.call(this, query, wrappedCallback);
+                    };
+                }
+            }, 500);
         },
         start() {
             try {
@@ -845,6 +1549,7 @@
                 this.ShopScrapper.init();
                 this.DialogScrapper.init();
                 this.QuestScrapper.init();
+                this.initNetworkHook();
                 updateStatus('Wszystkie moduły (mapy, przejścia, NPC, walki, sklepy, dialogi, questy) zainicjowane.');
             } catch (e) {
                 updateStatus(`Krytyczny błąd startu: ${e.message}`, true);

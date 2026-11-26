@@ -2,6 +2,7 @@
 // @name         Margonem Graph Visualizer
 // @namespace    http://tampermonkey.net/
 // @version      2.2
+// @author       Ronnie Radke
 // @description  Widok danych ze scrappera
 // @match        https://*.margonem.pl/
 // @exclude      https://www.margonem.pl/
