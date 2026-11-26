@@ -20,17 +20,8 @@ Do widoku z grafami GraphVisualizer
 
 ##### Tampermonkey 
 - scrapper
-https://pjsoftwaredeveloper.github.io/MargoScrapper/src/DataScrapper.user.js
+https://pjsoftwaredeveloper.github.io/MargoScrapper-Public/src/DataScrapper.user.js
 
 - widok danych z bazy
-https://pjsoftwaredeveloper.github.io/MargoScrapper/src/GraphVisualizer.user.js
+https://pjsoftwaredeveloper.github.io/MargoScrapper-Public/src/GraphVisualizer.user.js
 
-
-### Użyte narzędzia
-- MongoDB Atlas
-- PyMongo
-- Render
-- Flask
-- Flask-CORS
-- Gunicorn
-- Tampermonkey
